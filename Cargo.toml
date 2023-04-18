@@ -1,10 +1,10 @@
 [package]
 name = "withfd"
 description = "Send and receive data along with file descriptors"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-author = [ "Yuxuan Shui <yshuiv7@gmail.com>" ]
+authors = [ "Yuxuan Shui <yshuiv7@gmail.com>" ]
 categories = [ "os::unix-apis" ]
 keywords = [ "fd", "file_descriptor", "unix", "socket" ]
 repository = "https://github.com/yshui/withfd"

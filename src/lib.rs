@@ -18,10 +18,12 @@
 //! Process 1:
 //!
 //! ```no_run
+//! use std::{
+//!     fs::File,
+//!     os::unix::{io::AsFd, net::UnixListener},
+//! };
+//!
 //! use withfd::WithFdExt;
-//! use std::fs::File;
-//! use std::os::unix::io::AsFd;
-//! use std::os::unix::net::UnixListener;
 //!
 //! let file = File::open("/etc/passwd").unwrap();
 //! let listener = UnixListener::bind("/tmp/test.sock").unwrap();
@@ -33,11 +35,13 @@
 //! Process 2:
 //!
 //! ```no_run
+//! use std::{
+//!     fs::File,
+//!     io::Read,
+//!     os::unix::{io::FromRawFd, net::UnixStream},
+//! };
+//!
 //! use withfd::WithFdExt;
-//! use std::fs::File;
-//! use std::io::Read;
-//! use std::os::unix::io::FromRawFd;
-//! use std::os::unix::net::UnixStream;
 //!
 //! let stream = UnixStream::connect("/tmp/test.sock").unwrap();
 //! let mut stream = stream.with_fd();
@@ -102,10 +106,9 @@ impl Write for WithFd<std::os::unix::net::UnixStream> {
 }
 
 impl<T: AsRawFd> WithFd<T> {
-    fn write_with_fd_impl(&mut self, buf: &[u8], fds: &[BorrowedFd<'_>]) -> std::io::Result<usize> {
+    fn write_with_fd_impl(fd: RawFd, buf: &[u8], fds: &[BorrowedFd<'_>]) -> std::io::Result<usize> {
         // Safety: BorrowedFd is repr(transparent) over RawFd
         let fds = unsafe { std::slice::from_raw_parts(fds.as_ptr().cast::<RawFd>(), fds.len()) };
-        let fd = self.inner.as_raw_fd();
         let cmsg = nix::sys::socket::ControlMessage::ScmRights(fds);
         let sendmsg = nix::sys::socket::sendmsg::<()>(
             fd,
@@ -117,21 +120,29 @@ impl<T: AsRawFd> WithFd<T> {
         Ok(sendmsg)
     }
 
-    fn read_with_fd(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let fd = self.inner.as_raw_fd();
+    fn raw_read_with_fd(
+        fd: RawFd,
+        cmsg: &mut Vec<u8>,
+        out_fds: &mut Vec<OwnedFd>,
+        buf: &mut [u8],
+    ) -> std::io::Result<usize> {
         let recvmsg = nix::sys::socket::recvmsg::<()>(
             fd,
             &mut [IoSliceMut::new(buf)],
-            Some(&mut self.cmsg),
+            Some(cmsg),
             nix::sys::socket::MsgFlags::empty(),
         )?;
         for cmsg in recvmsg.cmsgs() {
             if let ControlMessageOwned::ScmRights(fds) = cmsg {
-                self.fds
-                    .extend(fds.iter().map(|&fd| unsafe { OwnedFd::from_raw_fd(fd) }));
+                out_fds.extend(fds.iter().map(|&fd| unsafe { OwnedFd::from_raw_fd(fd) }));
             }
         }
         Ok(recvmsg.bytes)
+    }
+
+    fn read_with_fd(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let fd = self.inner.as_raw_fd();
+        Self::raw_read_with_fd(fd, &mut self.cmsg, &mut self.fds, buf)
     }
 
     /// Returns an iterator over the file descriptors received.
@@ -155,7 +166,8 @@ impl WithFd<std::os::unix::net::UnixStream> {
     /// systems, file descriptors must be sent along with at least one byte
     /// of data. This is why there is not a `write_fd` method.
     pub fn write_with_fd(&mut self, buf: &[u8], fds: &[BorrowedFd<'_>]) -> std::io::Result<usize> {
-        self.write_with_fd_impl(buf, fds)
+        let fd = self.inner.as_raw_fd();
+        Self::write_with_fd_impl(fd, buf, fds)
     }
 }
 
@@ -213,6 +225,7 @@ mod test {
         assert_eq!(&buf[..], b"Hello");
     }
 
+    #[cfg(feature = "tokio")]
     #[tokio::test]
     async fn test_send_fd_async() {
         use tokio::io::AsyncReadExt;
@@ -228,6 +241,18 @@ mod test {
         let mut buf = [0u8; 5];
         b.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf[..], b"hello");
+        let read_handle = tokio::spawn(async move {
+            // Test that background read works
+            b.read_exact(&mut buf).await.unwrap();
+            (b, buf)
+        });
+
+        // Yield so the read has a chance to run
+        tokio::task::yield_now().await;
+
+        a.write_with_fd(b"world", &[]).await.unwrap();
+        let (mut b, mut buf) = read_handle.await.unwrap();
+        assert_eq!(&buf[..], b"world");
         let fds = b.take_fds().collect::<Vec<_>>();
         assert_eq!(fds.len(), 1);
 
@@ -247,30 +272,39 @@ mod test {
 #[doc(hidden)]
 pub mod tokio {
     use std::{
-        os::fd::{BorrowedFd, RawFd},
+        os::fd::{AsRawFd, BorrowedFd, RawFd},
         pin::Pin,
         task::ready,
     };
 
-    use tokio::io::{AsyncRead, AsyncWrite};
+    use tokio::io::{AsyncRead, AsyncWrite, Interest};
 
     use crate::WithFd;
 
     impl AsyncRead for WithFd<tokio::net::UnixStream> {
         fn poll_read(
-            mut self: std::pin::Pin<&mut Self>,
+            self: std::pin::Pin<&mut Self>,
             cx: &mut std::task::Context<'_>,
             buf: &mut tokio::io::ReadBuf<'_>,
         ) -> std::task::Poll<std::io::Result<()>> {
-            ready!(self.inner.poll_read_ready(cx))?;
             let unfilled = buf.initialize_unfilled();
-            match (*self).read_with_fd(unfilled) {
-                Ok(bytes) => {
-                    buf.advance(bytes);
-                    std::task::Poll::Ready(Ok(()))
-                },
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => std::task::Poll::Pending,
-                e => std::task::Poll::Ready(e.map(|_| ())),
+            let Self { inner, cmsg, fds } = self.get_mut();
+            let fd = inner.as_raw_fd();
+            loop {
+                ready!(inner.poll_read_ready(cx))?;
+                // Try reading, and clear the readiness state if we get WouldBlock.
+                match inner.try_io(Interest::READABLE, || {
+                    Self::raw_read_with_fd(fd, cmsg, fds, unfilled)
+                }) {
+                    Ok(bytes) => {
+                        buf.advance(bytes);
+                        return std::task::Poll::Ready(Ok(()))
+                    },
+                    // WouldBlock doesn't mean `try_io` would register us as a reader in the tokio
+                    // runtime, so we need to do one more loop and let `poll_read_ready` do it.
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                    e => return std::task::Poll::Ready(e.map(|_| ())),
+                }
             }
         }
     }
@@ -321,9 +355,12 @@ pub mod tokio {
             buf: &[u8],
             fds: &[BorrowedFd<'_>],
         ) -> std::io::Result<usize> {
+            let fd = self.inner.as_raw_fd();
             loop {
                 self.inner.writable().await?;
-                match self.write_with_fd_impl(buf, fds) {
+                match self.inner.try_io(Interest::WRITABLE, || {
+                    Self::write_with_fd_impl(fd, buf, fds)
+                }) {
                     Ok(bytes) => break Ok(bytes),
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
                     e => break Ok(e?),
