@@ -1,0 +1,26 @@
+[package]
+name = "withfd"
+description = "Send and receive data along with file descriptors"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+author = [ "Yuxuan Shui <yshuiv7@gmail.com>" ]
+categories = [ "os::unix-apis" ]
+keywords = [ "fd", "file_descriptor", "unix", "socket" ]
+repository = "https://github.com/yshui/withfd"
+documentation = "https://docs.rs/withfd"
+
+[dependencies]
+cstr = "0.2.11"
+nix = { version = "0.26.2", default-features = false, features = ["socket", "uio", "fs"] }
+tokio = { version = "1", features = ["net"], optional = true }
+
+[features]
+default = []
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros", "io-util"] }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
