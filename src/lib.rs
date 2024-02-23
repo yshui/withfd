@@ -126,9 +126,10 @@ impl<T: AsRawFd> WithFd<T> {
         out_fds: &mut Vec<OwnedFd>,
         buf: &mut [u8],
     ) -> std::io::Result<usize> {
+        let mut buf = [IoSliceMut::new(buf)];
         let recvmsg = nix::sys::socket::recvmsg::<()>(
             fd,
-            &mut [IoSliceMut::new(buf)],
+            &mut buf,
             Some(cmsg),
             nix::sys::socket::MsgFlags::empty(),
         )?;
@@ -196,8 +197,10 @@ mod test {
     };
 
     use cstr::cstr;
+    #[cfg(target_os = "linux")]
     use nix::sys::memfd::MemFdCreateFlag;
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_send_fd() {
         let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
