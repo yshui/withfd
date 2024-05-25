@@ -232,9 +232,9 @@ mod test {
     #[cfg(feature = "async-io")]
     #[tokio::test]
     async fn test_send_fd_async_async_io() {
-        use futures_util::io::AsyncReadExt;
+        use futures_util::io::{AsyncReadExt, AsyncWriteExt};
         let (a, b) = async_io::Async::<std::os::unix::net::UnixStream>::pair().unwrap();
-        let mut a = super::WithFd::from(a);
+        let a = super::WithFd::from(a);
         let mut b = super::WithFd::from(b);
 
         let memfd =
@@ -243,6 +243,7 @@ mod test {
         tokio::spawn(async move {
             memfd.write_all(b"Hello").unwrap();
             a.write_with_fd(b"hello", &[memfd.as_fd()]).await.unwrap();
+            (&a).write_all(b"world").await.unwrap();
             drop(memfd);
         });
         let mut buf = [0u8; 5];
@@ -250,6 +251,8 @@ mod test {
         assert_eq!(&buf[..], b"hello");
         let fds = b.take_fds().collect::<Vec<_>>();
         assert_eq!(fds.len(), 1);
+        b.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf[..], b"world");
 
         let mut memfd2: File = fds.into_iter().next().unwrap().into();
 
@@ -447,6 +450,41 @@ pub mod async_io {
         }
     }
 
+    impl<T> AsyncWrite for &WithFd<Async<T>>
+    where
+        for<'a> &'a Async<T>: AsyncWrite,
+    {
+        fn poll_close(
+            self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<futures_io::Result<()>> {
+            Pin::new(&mut &self.inner).poll_close(cx)
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<futures_io::Result<()>> {
+            Pin::new(&mut &self.inner).poll_flush(cx)
+        }
+
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<futures_io::Result<usize>> {
+            Pin::new(&mut &self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_write_vectored(
+            self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            bufs: &[futures_io::IoSlice<'_>],
+        ) -> std::task::Poll<futures_io::Result<usize>> {
+            Pin::new(&mut &self.inner).poll_write_vectored(cx, bufs)
+        }
+    }
+
     impl<T> AsyncWrite for WithFd<Async<T>>
     where
         Async<T>: AsyncWrite,
@@ -487,7 +525,7 @@ pub mod async_io {
         /// least one byte of data. This is why there is not a
         /// `write_fd` method.
         pub async fn write_with_fd(
-            &mut self,
+            &self,
             buf: &[u8],
             fds: &[std::os::fd::BorrowedFd<'_>],
         ) -> std::io::Result<usize> {
