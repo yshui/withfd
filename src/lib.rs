@@ -66,7 +66,9 @@ use nix::sys::socket::ControlMessageOwned;
 ///
 /// You can create this by using the [`WithFdExt `] trait and calling the
 /// `with_fd` method on supported types.
+#[cfg_attr(feature = "async-io", pin_project::pin_project)]
 pub struct WithFd<T> {
+    #[cfg_attr(feature = "async-io", pin)]
     inner: T,
     fds:   Vec<OwnedFd>,
     cmsg:  Vec<u8>,
@@ -227,9 +229,38 @@ mod test {
         assert_eq!(&buf[..], b"Hello");
     }
 
+    #[cfg(feature = "async-io")]
+    #[tokio::test]
+    async fn test_send_fd_async_async_io() {
+        use futures_util::io::AsyncReadExt;
+        let (a, b) = async_io::Async::<std::os::unix::net::UnixStream>::pair().unwrap();
+        let mut a = super::WithFd::from(a);
+        let mut b = super::WithFd::from(b);
+
+        let memfd =
+            nix::sys::memfd::memfd_create(cstr!("test"), MemFdCreateFlag::MFD_CLOEXEC).unwrap();
+        let mut memfd: File = memfd.into();
+        tokio::spawn(async move {
+            memfd.write_all(b"Hello").unwrap();
+            a.write_with_fd(b"hello", &[memfd.as_fd()]).await.unwrap();
+            drop(memfd);
+        });
+        let mut buf = [0u8; 5];
+        b.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf[..], b"hello");
+        let fds = b.take_fds().collect::<Vec<_>>();
+        assert_eq!(fds.len(), 1);
+
+        let mut memfd2: File = fds.into_iter().next().unwrap().into();
+
+        memfd2.rewind().unwrap();
+        memfd2.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf[..], b"Hello");
+    }
+
     #[cfg(feature = "tokio")]
     #[tokio::test]
-    async fn test_send_fd_async() {
+    async fn test_send_fd_async_tokio() {
         use tokio::io::AsyncReadExt;
         let (a, b) = tokio::net::UnixStream::pair().unwrap();
         let mut a = super::WithFd::from(a);
@@ -380,6 +411,109 @@ pub mod tokio {
         }
     }
     impl super::WithFdExt for tokio::net::UnixStream {
+        fn with_fd(self) -> super::WithFd<Self> {
+            self.into()
+        }
+    }
+}
+
+#[cfg(any(feature = "async-io", docsrs))]
+#[cfg_attr(docsrs, doc(cfg(feature = "async-io")))]
+#[doc(hidden)]
+pub mod async_io {
+    use std::{os::fd::AsRawFd, pin::Pin, task::ready};
+
+    use async_io::Async;
+    use futures_io::{AsyncRead, AsyncWrite};
+
+    use crate::WithFd;
+
+    impl AsyncRead for WithFd<Async<std::os::unix::net::UnixStream>> {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut [u8],
+        ) -> std::task::Poll<futures_io::Result<usize>> {
+            let this = self.project();
+            let fd = this.inner.as_raw_fd();
+            loop {
+                match Self::raw_read_with_fd(fd, this.cmsg, this.fds, buf) {
+                    Ok(bytes) => return std::task::Poll::Ready(Ok(bytes)),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => (),
+                    e => return std::task::Poll::Ready(e),
+                }
+                ready!(this.inner.poll_readable(cx))?;
+            }
+        }
+    }
+
+    impl<T> AsyncWrite for WithFd<Async<T>>
+    where
+        Async<T>: AsyncWrite,
+    {
+        fn poll_close(
+            self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<futures_io::Result<()>> {
+            self.project().inner.poll_close(cx)
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<futures_io::Result<()>> {
+            self.project().inner.poll_flush(cx)
+        }
+
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<futures_io::Result<usize>> {
+            self.project().inner.poll_write(cx, buf)
+        }
+
+        fn poll_write_vectored(
+            self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            bufs: &[futures_io::IoSlice<'_>],
+        ) -> std::task::Poll<futures_io::Result<usize>> {
+            self.project().inner.poll_write_vectored(cx, bufs)
+        }
+    }
+    impl WithFd<Async<std::os::unix::net::UnixStream>> {
+        /// Write data, with additional pass file descriptors. For most of the
+        /// unix systems, file descriptors must be sent along with at
+        /// least one byte of data. This is why there is not a
+        /// `write_fd` method.
+        pub async fn write_with_fd(
+            &mut self,
+            buf: &[u8],
+            fds: &[std::os::fd::BorrowedFd<'_>],
+        ) -> std::io::Result<usize> {
+            let fd = self.inner.as_raw_fd();
+            loop {
+                self.inner.writable().await?;
+                match Self::write_with_fd_impl(fd, buf, fds) {
+                    Ok(bytes) => break Ok(bytes),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                    e => break Ok(e?),
+                }
+            }
+        }
+    }
+
+    impl From<Async<std::os::unix::net::UnixStream>> for WithFd<Async<std::os::unix::net::UnixStream>> {
+        fn from(inner: Async<std::os::unix::net::UnixStream>) -> Self {
+            Self {
+                inner,
+                fds: Vec::new(),
+                cmsg: nix::cmsg_space!([std::os::unix::io::RawFd; super::SCM_MAX_FD]),
+            }
+        }
+    }
+
+    impl super::WithFdExt for Async<std::os::unix::net::UnixStream> {
         fn with_fd(self) -> super::WithFd<Self> {
             self.into()
         }
