@@ -133,7 +133,7 @@ impl<T: AsRawFd> WithFd<T> {
             Some(cmsg),
             nix::sys::socket::MsgFlags::empty(),
         )?;
-        for cmsg in recvmsg.cmsgs() {
+        for cmsg in recvmsg.cmsgs()? {
             if let ControlMessageOwned::ScmRights(fds) = cmsg {
                 out_fds.extend(fds.iter().map(|&fd| unsafe { OwnedFd::from_raw_fd(fd) }));
             }
@@ -193,7 +193,7 @@ mod test {
     use std::{
         fs::File,
         io::{Read, Seek, Write},
-        os::fd::{AsFd, FromRawFd, OwnedFd},
+        os::fd::AsFd,
     };
 
     use cstr::cstr;
@@ -209,7 +209,6 @@ mod test {
 
         let memfd =
             nix::sys::memfd::memfd_create(cstr!("test"), MemFdCreateFlag::MFD_CLOEXEC).unwrap();
-        let memfd = unsafe { OwnedFd::from_raw_fd(memfd) };
         let mut memfd: File = memfd.into();
         a.write_with_fd(b"hello", &[memfd.as_fd()]).unwrap();
         let mut buf = [0u8; 5];
