@@ -208,6 +208,7 @@ mod test {
     };
 
     use nix::sys::memfd::MFdFlags;
+    #[cfg(feature = "tokio")]
     use tokio::io::AsyncReadExt as _;
 
     #[test]
