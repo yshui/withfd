@@ -74,6 +74,16 @@ pub struct WithFd<T> {
     cmsg:  Vec<u8>,
 }
 
+impl<T> WithFd<T> {
+    fn new(inner: T) -> Self {
+        Self {
+            inner,
+            fds: Vec::new(),
+            cmsg: nix::cmsg_space!([RawFd; SCM_MAX_FD]),
+        }
+    }
+}
+
 pub trait WithFdExt: Sized {
     fn with_fd(self) -> WithFd<Self>;
 }
@@ -185,11 +195,7 @@ impl WithFdExt for std::os::unix::net::UnixStream {
 
 impl From<std::os::unix::net::UnixStream> for WithFd<std::os::unix::net::UnixStream> {
     fn from(inner: std::os::unix::net::UnixStream) -> Self {
-        Self {
-            inner,
-            fds: Vec::new(),
-            cmsg: nix::cmsg_space!([RawFd; SCM_MAX_FD]),
-        }
+        Self::new(inner)
     }
 }
 
@@ -201,18 +207,16 @@ mod test {
         os::fd::AsFd,
     };
 
-    #[cfg(target_os = "linux")]
     use nix::sys::memfd::MFdFlags;
+    use tokio::io::AsyncReadExt as _;
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn test_send_fd() {
         let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
         let mut a = super::WithFd::from(a);
         let mut b = super::WithFd::from(b);
 
-        let memfd =
-            nix::sys::memfd::memfd_create(c"test", MFdFlags::MFD_CLOEXEC).unwrap();
+        let memfd = nix::sys::memfd::memfd_create(c"test", MFdFlags::MFD_CLOEXEC).unwrap();
         let mut memfd: File = memfd.into();
         a.write_with_fd(b"hello", &[memfd.as_fd()]).unwrap();
         let mut buf = [0u8; 5];
@@ -239,8 +243,7 @@ mod test {
         let a = super::WithFd::from(a);
         let mut b = super::WithFd::from(b);
 
-        let memfd =
-            nix::sys::memfd::memfd_create(c"test", MFdFlags::MFD_CLOEXEC).unwrap();
+        let memfd = nix::sys::memfd::memfd_create(c"test", MFdFlags::MFD_CLOEXEC).unwrap();
         let mut memfd: File = memfd.into();
         tokio::spawn(async move {
             memfd.write_all(b"Hello").unwrap();
@@ -266,13 +269,11 @@ mod test {
     #[cfg(feature = "tokio")]
     #[tokio::test]
     async fn test_send_fd_async_tokio() {
-        use tokio::io::AsyncReadExt;
         let (a, b) = tokio::net::UnixStream::pair().unwrap();
-        let mut a = super::WithFd::from(a);
+        let a = super::WithFd::from(a);
         let mut b = super::WithFd::from(b);
 
-        let memfd =
-            nix::sys::memfd::memfd_create(c"test", MFdFlags::MFD_CLOEXEC).unwrap();
+        let memfd = nix::sys::memfd::memfd_create(c"test", MFdFlags::MFD_CLOEXEC).unwrap();
         let mut memfd: File = memfd.into();
         a.write_with_fd(b"hello", &[memfd.as_fd()]).await.unwrap();
         let mut buf = [0u8; 5];
@@ -302,6 +303,57 @@ mod test {
         memfd2.read_exact(&mut buf).unwrap();
         assert_eq!(&buf[..], b"Hello");
     }
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn test_tokio_halves() {
+        let (a, b) = tokio::net::UnixStream::pair().unwrap();
+        let (a_read, a_write) = a.into_split();
+        let (b_read, b_write) = b.into_split();
+
+        let a_write = super::WithFd::from(a_write);
+        let mut b_read = super::WithFd::from(b_read);
+        let b_write = super::WithFd::from(b_write);
+        let mut a_read = super::WithFd::from(a_read);
+
+        let memfd = nix::sys::memfd::memfd_create(c"test", MFdFlags::MFD_CLOEXEC).unwrap();
+        let mut memfd: File = memfd.into();
+
+        a_write
+            .write_with_fd(b"hello", &[memfd.as_fd()])
+            .await
+            .unwrap();
+
+        let mut buf = [0u8; 5];
+        b_read.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf[..], b"hello");
+        let fds = b_read.take_fds().collect::<Vec<_>>();
+        assert_eq!(fds.len(), 1);
+
+        let mut memfd2: File = fds.into_iter().next().unwrap().into();
+        memfd.write_all(b"Hello").unwrap();
+        drop(memfd);
+        memfd2.rewind().unwrap();
+        memfd2.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf[..], b"Hello");
+
+        b_write.write_with_fd(b"world", &[]).await.unwrap();
+        a_read.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf[..], b"world");
+
+        let read_handle = tokio::spawn(async move {
+            // Test that background read works
+            a_read.read_exact(&mut buf).await.unwrap();
+            (a_read, buf)
+        });
+
+        // Yield so the read has a chance to run
+        tokio::task::yield_now().await;
+
+        b_write.write_with_fd(b"world", &[]).await.unwrap();
+        let (_a_read, buf) = read_handle.await.unwrap();
+        assert_eq!(&buf[..], b"world");
+    }
 }
 
 #[cfg(any(feature = "tokio", docsrs))]
@@ -309,7 +361,7 @@ mod test {
 #[doc(hidden)]
 pub mod tokio {
     use std::{
-        os::fd::{AsRawFd, BorrowedFd, RawFd},
+        os::fd::{AsRawFd, BorrowedFd, OwnedFd},
         pin::Pin,
         task::ready,
     };
@@ -318,32 +370,53 @@ pub mod tokio {
 
     use crate::WithFd;
 
+    fn poll_read(
+        inner: &tokio::net::UnixStream,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+        cmsg: &mut [u8],
+        out_fds: &mut Vec<OwnedFd>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let unfilled = buf.initialize_unfilled();
+        let fd = inner.as_raw_fd();
+        loop {
+            ready!(inner.poll_read_ready(cx))?;
+            // Try reading, and clear the readiness state if we get
+            // WouldBlock.
+            match inner.try_io(Interest::READABLE, || {
+                super::read_with_fd(fd, cmsg, out_fds, unfilled)
+            }) {
+                Ok(bytes) => {
+                    buf.advance(bytes);
+                    return std::task::Poll::Ready(Ok(()))
+                },
+                // WouldBlock doesn't mean `try_io` would register us as a reader in the tokio
+                // runtime, so we need to do one more loop and let `poll_read_ready` do it.
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                e => return std::task::Poll::Ready(e.map(|_| ())),
+            }
+        }
+    }
+
+    impl AsyncRead for WithFd<tokio::net::unix::OwnedReadHalf> {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let Self { inner, cmsg, fds } = self.get_mut();
+            poll_read(inner.as_ref(), cx, buf, cmsg, fds)
+        }
+    }
+
     impl AsyncRead for WithFd<tokio::net::UnixStream> {
         fn poll_read(
             self: std::pin::Pin<&mut Self>,
             cx: &mut std::task::Context<'_>,
             buf: &mut tokio::io::ReadBuf<'_>,
         ) -> std::task::Poll<std::io::Result<()>> {
-            let unfilled = buf.initialize_unfilled();
             let Self { inner, cmsg, fds } = self.get_mut();
-            let fd = inner.as_raw_fd();
-            loop {
-                ready!(inner.poll_read_ready(cx))?;
-                // Try reading, and clear the readiness state if we get
-                // WouldBlock.
-                match inner.try_io(Interest::READABLE, || {
-                    super::read_with_fd(fd, cmsg, fds, unfilled)
-                }) {
-                    Ok(bytes) => {
-                        buf.advance(bytes);
-                        return std::task::Poll::Ready(Ok(()))
-                    },
-                    // WouldBlock doesn't mean `try_io` would register us as a reader in the tokio
-                    // runtime, so we need to do one more loop and let `poll_read_ready` do it.
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
-                    e => return std::task::Poll::Ready(e.map(|_| ())),
-                }
-            }
+            poll_read(inner, cx, buf, cmsg, fds)
         }
     }
 
@@ -383,39 +456,117 @@ pub mod tokio {
         }
     }
 
+    impl AsyncWrite for WithFd<tokio::net::unix::OwnedWriteHalf> {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<Result<usize, std::io::Error>> {
+            Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), std::io::Error>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), std::io::Error>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+
+        fn poll_write_vectored(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            bufs: &[std::io::IoSlice<'_>],
+        ) -> std::task::Poll<Result<usize, std::io::Error>> {
+            Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+        }
+
+        fn is_write_vectored(&self) -> bool {
+            self.inner.is_write_vectored()
+        }
+    }
+
+    async fn write_with_fd(
+        inner: &tokio::net::UnixStream,
+        buf: &[u8],
+        fds: &[BorrowedFd<'_>],
+    ) -> std::io::Result<usize> {
+        let fd = inner.as_raw_fd();
+        loop {
+            inner.writable().await?;
+            match inner.try_io(Interest::WRITABLE, || super::write_with_fd(fd, buf, fds)) {
+                Ok(bytes) => break Ok(bytes),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                e => break Ok(e?),
+            }
+        }
+    }
+
     impl WithFd<tokio::net::UnixStream> {
         /// Write data, with additional pass file descriptors. For most of the
         /// unix systems, file descriptors must be sent along with at
         /// least one byte of data. This is why there is not a
         /// `write_fd` method.
         pub async fn write_with_fd(
-            &mut self,
+            &self,
             buf: &[u8],
             fds: &[BorrowedFd<'_>],
         ) -> std::io::Result<usize> {
-            let fd = self.inner.as_raw_fd();
-            loop {
-                self.inner.writable().await?;
-                match self.inner.try_io(Interest::WRITABLE, || {
-                    super::write_with_fd(fd, buf, fds)
-                }) {
-                    Ok(bytes) => break Ok(bytes),
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
-                    e => break Ok(e?),
-                }
-            }
+            write_with_fd(&self.inner, buf, fds).await
         }
     }
+
+    impl WithFd<tokio::net::unix::OwnedWriteHalf> {
+        /// Write data, with additional pass file descriptors. For most of the
+        /// unix systems, file descriptors must be sent along with at
+        /// least one byte of data. This is why there is not a
+        /// `write_fd` method.
+        pub async fn write_with_fd(
+            &self,
+            buf: &[u8],
+            fds: &[BorrowedFd<'_>],
+        ) -> std::io::Result<usize> {
+            write_with_fd(self.inner.as_ref(), buf, fds).await
+        }
+    }
+
     impl From<tokio::net::UnixStream> for WithFd<tokio::net::UnixStream> {
         fn from(inner: tokio::net::UnixStream) -> Self {
-            Self {
-                inner,
-                fds: Vec::new(),
-                cmsg: nix::cmsg_space!([RawFd; super::SCM_MAX_FD]),
-            }
+            Self::new(inner)
         }
     }
+
+    impl From<tokio::net::unix::OwnedWriteHalf> for WithFd<tokio::net::unix::OwnedWriteHalf> {
+        fn from(inner: tokio::net::unix::OwnedWriteHalf) -> Self {
+            Self::new(inner)
+        }
+    }
+
+    impl From<tokio::net::unix::OwnedReadHalf> for WithFd<tokio::net::unix::OwnedReadHalf> {
+        fn from(inner: tokio::net::unix::OwnedReadHalf) -> Self {
+            Self::new(inner)
+        }
+    }
+
     impl super::WithFdExt for tokio::net::UnixStream {
+        fn with_fd(self) -> super::WithFd<Self> {
+            self.into()
+        }
+    }
+
+    impl super::WithFdExt for tokio::net::unix::OwnedReadHalf {
+        fn with_fd(self) -> super::WithFd<Self> {
+            self.into()
+        }
+    }
+
+    impl super::WithFdExt for tokio::net::unix::OwnedWriteHalf {
         fn with_fd(self) -> super::WithFd<Self> {
             self.into()
         }
@@ -545,11 +696,7 @@ pub mod async_io {
 
     impl From<Async<std::os::unix::net::UnixStream>> for WithFd<Async<std::os::unix::net::UnixStream>> {
         fn from(inner: Async<std::os::unix::net::UnixStream>) -> Self {
-            Self {
-                inner,
-                fds: Vec::new(),
-                cmsg: nix::cmsg_space!([std::os::unix::io::RawFd; super::SCM_MAX_FD]),
-            }
+            Self::new(inner)
         }
     }
 
