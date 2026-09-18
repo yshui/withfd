@@ -354,6 +354,64 @@ mod test {
         let (_a_read, buf) = read_handle.await.unwrap();
         assert_eq!(&buf[..], b"world");
     }
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn test_tokio_ref_halves() {
+        use super::WithFdExt as _;
+
+        let (mut a, mut b) = tokio::net::UnixStream::pair().unwrap();
+        let (b_read, b_write) = b.split();
+        let mut b_read = b_read.with_fd();
+        let b_write = b_write.with_fd();
+
+        {
+            let (a_read, a_write) = a.split();
+            let mut a_read = a_read.with_fd();
+            let a_write = a_write.with_fd();
+
+            let memfd = nix::sys::memfd::memfd_create(c"test", MFdFlags::MFD_CLOEXEC).unwrap();
+            let mut memfd: File = memfd.into();
+
+            a_write
+                .write_with_fd(b"hello", &[memfd.as_fd()])
+                .await
+                .unwrap();
+
+            let mut buf = [0u8; 5];
+            b_read.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf[..], b"hello");
+            let fds = b_read.take_fds().collect::<Vec<_>>();
+            assert_eq!(fds.len(), 1);
+
+            let mut memfd2: File = fds.into_iter().next().unwrap().into();
+            memfd.write_all(b"Hello").unwrap();
+            drop(memfd);
+            memfd2.rewind().unwrap();
+            memfd2.read_exact(&mut buf).unwrap();
+            assert_eq!(&buf[..], b"Hello");
+
+            b_write.write_with_fd(b"world", &[]).await.unwrap();
+            a_read.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf[..], b"world");
+        }
+
+        let mut buf = [0u8; 5];
+        let read_handle = tokio::spawn(async move {
+            // Test that background read works
+            let (a_read, _a_write) = a.split();
+            let mut a_read = a_read.with_fd();
+            a_read.read_exact(&mut buf).await.unwrap();
+            buf
+        });
+
+        // Yield so the read has a chance to run
+        tokio::task::yield_now().await;
+
+        b_write.write_with_fd(b"world", &[]).await.unwrap();
+        let buf = read_handle.await.unwrap();
+        assert_eq!(&buf[..], b"world");
+    }
 }
 
 #[cfg(any(feature = "tokio", docsrs))]
@@ -399,6 +457,17 @@ pub mod tokio {
     }
 
     impl AsyncRead for WithFd<tokio::net::unix::OwnedReadHalf> {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let Self { inner, cmsg, fds } = self.get_mut();
+            poll_read(inner.as_ref(), cx, buf, cmsg, fds)
+        }
+    }
+
+    impl AsyncRead for WithFd<tokio::net::unix::ReadHalf<'_>> {
         fn poll_read(
             self: Pin<&mut Self>,
             cx: &mut std::task::Context<'_>,
@@ -492,6 +561,42 @@ pub mod tokio {
         }
     }
 
+    impl AsyncWrite for WithFd<tokio::net::unix::WriteHalf<'_>> {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<Result<usize, std::io::Error>> {
+            Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), std::io::Error>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), std::io::Error>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+
+        fn poll_write_vectored(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            bufs: &[std::io::IoSlice<'_>],
+        ) -> std::task::Poll<Result<usize, std::io::Error>> {
+            Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+        }
+
+        fn is_write_vectored(&self) -> bool {
+            self.inner.is_write_vectored()
+        }
+    }
+
     async fn write_with_fd(
         inner: &tokio::net::UnixStream,
         buf: &[u8],
@@ -536,6 +641,20 @@ pub mod tokio {
         }
     }
 
+    impl WithFd<tokio::net::unix::WriteHalf<'_>> {
+        /// Write data, with additional pass file descriptors. For most of the
+        /// unix systems, file descriptors must be sent along with at
+        /// least one byte of data. This is why there is not a
+        /// `write_fd` method.
+        pub async fn write_with_fd(
+            &self,
+            buf: &[u8],
+            fds: &[BorrowedFd<'_>],
+        ) -> std::io::Result<usize> {
+            write_with_fd(self.inner.as_ref(), buf, fds).await
+        }
+    }
+
     impl From<tokio::net::UnixStream> for WithFd<tokio::net::UnixStream> {
         fn from(inner: tokio::net::UnixStream) -> Self {
             Self::new(inner)
@@ -554,6 +673,18 @@ pub mod tokio {
         }
     }
 
+    impl<'a> From<tokio::net::unix::ReadHalf<'a>> for WithFd<tokio::net::unix::ReadHalf<'a>> {
+        fn from(inner: tokio::net::unix::ReadHalf<'a>) -> Self {
+            Self::new(inner)
+        }
+    }
+
+    impl<'a> From<tokio::net::unix::WriteHalf<'a>> for WithFd<tokio::net::unix::WriteHalf<'a>> {
+        fn from(inner: tokio::net::unix::WriteHalf<'a>) -> Self {
+            Self::new(inner)
+        }
+    }
+
     impl super::WithFdExt for tokio::net::UnixStream {
         fn with_fd(self) -> super::WithFd<Self> {
             self.into()
@@ -567,6 +698,18 @@ pub mod tokio {
     }
 
     impl super::WithFdExt for tokio::net::unix::OwnedWriteHalf {
+        fn with_fd(self) -> super::WithFd<Self> {
+            self.into()
+        }
+    }
+
+    impl super::WithFdExt for tokio::net::unix::ReadHalf<'_> {
+        fn with_fd(self) -> super::WithFd<Self> {
+            self.into()
+        }
+    }
+
+    impl super::WithFdExt for tokio::net::unix::WriteHalf<'_> {
         fn with_fd(self) -> super::WithFd<Self> {
             self.into()
         }
