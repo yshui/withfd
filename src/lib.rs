@@ -107,47 +107,49 @@ impl Write for WithFd<std::os::unix::net::UnixStream> {
     }
 }
 
-impl<T: AsRawFd> WithFd<T> {
-    fn write_with_fd_impl(fd: RawFd, buf: &[u8], fds: &[BorrowedFd<'_>]) -> std::io::Result<usize> {
-        // Safety: BorrowedFd is repr(transparent) over RawFd
-        let fds = unsafe { std::slice::from_raw_parts(fds.as_ptr().cast::<RawFd>(), fds.len()) };
-        let cmsg = nix::sys::socket::ControlMessage::ScmRights(fds);
-        let sendmsg = nix::sys::socket::sendmsg::<()>(
-            fd,
-            &[IoSlice::new(buf)],
-            &[cmsg],
-            nix::sys::socket::MsgFlags::empty(),
-            None,
-        )?;
-        Ok(sendmsg)
-    }
+fn write_with_fd(fd: RawFd, buf: &[u8], fds: &[BorrowedFd<'_>]) -> std::io::Result<usize> {
+    // Safety: BorrowedFd is repr(transparent) over RawFd
+    let fds = unsafe { std::slice::from_raw_parts(fds.as_ptr().cast::<RawFd>(), fds.len()) };
+    let cmsg = nix::sys::socket::ControlMessage::ScmRights(fds);
+    let sendmsg = nix::sys::socket::sendmsg::<()>(
+        fd,
+        &[IoSlice::new(buf)],
+        &[cmsg],
+        nix::sys::socket::MsgFlags::empty(),
+        None,
+    )?;
+    Ok(sendmsg)
+}
 
-    fn raw_read_with_fd(
-        fd: RawFd,
-        cmsg: &mut Vec<u8>,
-        out_fds: &mut Vec<OwnedFd>,
-        buf: &mut [u8],
-    ) -> std::io::Result<usize> {
-        let mut buf = [IoSliceMut::new(buf)];
-        let recvmsg = nix::sys::socket::recvmsg::<()>(
-            fd,
-            &mut buf,
-            Some(cmsg),
-            nix::sys::socket::MsgFlags::empty(),
-        )?;
-        for cmsg in recvmsg.cmsgs()? {
-            if let ControlMessageOwned::ScmRights(fds) = cmsg {
-                out_fds.extend(fds.iter().map(|&fd| unsafe { OwnedFd::from_raw_fd(fd) }));
-            }
+fn read_with_fd(
+    fd: RawFd,
+    cmsg: &mut [u8],
+    out_fds: &mut Vec<OwnedFd>,
+    buf: &mut [u8],
+) -> std::io::Result<usize> {
+    let mut buf = [IoSliceMut::new(buf)];
+    let recvmsg = nix::sys::socket::recvmsg::<()>(
+        fd,
+        &mut buf,
+        Some(cmsg),
+        nix::sys::socket::MsgFlags::empty(),
+    )?;
+    for cmsg in recvmsg.cmsgs()? {
+        if let ControlMessageOwned::ScmRights(fds) = cmsg {
+            out_fds.extend(fds.iter().map(|&fd| unsafe { OwnedFd::from_raw_fd(fd) }));
         }
-        Ok(recvmsg.bytes)
     }
+    Ok(recvmsg.bytes)
+}
 
+impl<T: AsRawFd> WithFd<T> {
     fn read_with_fd(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let fd = self.inner.as_raw_fd();
-        Self::raw_read_with_fd(fd, &mut self.cmsg, &mut self.fds, buf)
+        read_with_fd(fd, &mut self.cmsg, &mut self.fds, buf)
     }
+}
 
+impl<T> WithFd<T> {
     /// Returns an iterator over the file descriptors received.
     /// Every file descriptor this iterator yields will be removed from the
     /// internal buffer, and will not be returned again. Dropping the iterator
@@ -164,13 +166,14 @@ impl<T: AsRawFd> WithFd<T> {
         Iter(&mut self.fds)
     }
 }
+
 impl WithFd<std::os::unix::net::UnixStream> {
     /// Write data, with additional pass file descriptors. For most of the unix
     /// systems, file descriptors must be sent along with at least one byte
     /// of data. This is why there is not a `write_fd` method.
     pub fn write_with_fd(&mut self, buf: &[u8], fds: &[BorrowedFd<'_>]) -> std::io::Result<usize> {
         let fd = self.inner.as_raw_fd();
-        Self::write_with_fd_impl(fd, buf, fds)
+        write_with_fd(fd, buf, fds)
     }
 }
 
@@ -198,9 +201,8 @@ mod test {
         os::fd::AsFd,
     };
 
-    use cstr::cstr;
     #[cfg(target_os = "linux")]
-    use nix::sys::memfd::MemFdCreateFlag;
+    use nix::sys::memfd::MFdFlags;
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -210,7 +212,7 @@ mod test {
         let mut b = super::WithFd::from(b);
 
         let memfd =
-            nix::sys::memfd::memfd_create(cstr!("test"), MemFdCreateFlag::MFD_CLOEXEC).unwrap();
+            nix::sys::memfd::memfd_create(c"test", MFdFlags::MFD_CLOEXEC).unwrap();
         let mut memfd: File = memfd.into();
         a.write_with_fd(b"hello", &[memfd.as_fd()]).unwrap();
         let mut buf = [0u8; 5];
@@ -238,7 +240,7 @@ mod test {
         let mut b = super::WithFd::from(b);
 
         let memfd =
-            nix::sys::memfd::memfd_create(cstr!("test"), MemFdCreateFlag::MFD_CLOEXEC).unwrap();
+            nix::sys::memfd::memfd_create(c"test", MFdFlags::MFD_CLOEXEC).unwrap();
         let mut memfd: File = memfd.into();
         tokio::spawn(async move {
             memfd.write_all(b"Hello").unwrap();
@@ -270,8 +272,7 @@ mod test {
         let mut b = super::WithFd::from(b);
 
         let memfd =
-            nix::sys::memfd::memfd_create(cstr!("test"), MemFdCreateFlag::MFD_CLOEXEC).unwrap();
-        let memfd = unsafe { OwnedFd::from_raw_fd(memfd) };
+            nix::sys::memfd::memfd_create(c"test", MFdFlags::MFD_CLOEXEC).unwrap();
         let mut memfd: File = memfd.into();
         a.write_with_fd(b"hello", &[memfd.as_fd()]).await.unwrap();
         let mut buf = [0u8; 5];
@@ -328,9 +329,10 @@ pub mod tokio {
             let fd = inner.as_raw_fd();
             loop {
                 ready!(inner.poll_read_ready(cx))?;
-                // Try reading, and clear the readiness state if we get WouldBlock.
+                // Try reading, and clear the readiness state if we get
+                // WouldBlock.
                 match inner.try_io(Interest::READABLE, || {
-                    Self::raw_read_with_fd(fd, cmsg, fds, unfilled)
+                    super::read_with_fd(fd, cmsg, fds, unfilled)
                 }) {
                     Ok(bytes) => {
                         buf.advance(bytes);
@@ -395,7 +397,7 @@ pub mod tokio {
             loop {
                 self.inner.writable().await?;
                 match self.inner.try_io(Interest::WRITABLE, || {
-                    Self::write_with_fd_impl(fd, buf, fds)
+                    super::write_with_fd(fd, buf, fds)
                 }) {
                     Ok(bytes) => break Ok(bytes),
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
@@ -440,7 +442,7 @@ pub mod async_io {
             let this = self.project();
             let fd = this.inner.as_raw_fd();
             loop {
-                match Self::raw_read_with_fd(fd, this.cmsg, this.fds, buf) {
+                match super::read_with_fd(fd, this.cmsg, this.fds, buf) {
                     Ok(bytes) => return std::task::Poll::Ready(Ok(bytes)),
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => (),
                     e => return std::task::Poll::Ready(e),
@@ -532,7 +534,7 @@ pub mod async_io {
             let fd = self.inner.as_raw_fd();
             loop {
                 self.inner.writable().await?;
-                match Self::write_with_fd_impl(fd, buf, fds) {
+                match super::write_with_fd(fd, buf, fds) {
                     Ok(bytes) => break Ok(bytes),
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
                     e => break Ok(e?),
